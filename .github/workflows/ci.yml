@@ -1,13 +1,16 @@
 name: CI
 
 on:
+  # Only the default branch runs on push. Branch pushes are covered by the
+  # pull_request trigger, so a branch with an open PR does not run everything
+  # twice on one commit and starve itself of runners.
   push:
-    branches: ['**']
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -17,6 +20,9 @@ jobs:
   verify:
     name: Typecheck, test and build
     runs-on: ubuntu-latest
+    # A stalled job should fail fast and legibly rather than sit until the
+    # default six-hour ceiling.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -46,6 +52,7 @@ jobs:
   docker:
     name: Build container image
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
