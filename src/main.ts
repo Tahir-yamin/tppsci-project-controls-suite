@@ -1,14 +1,32 @@
 import { parseXERText } from './xerParser';
-import { calculateDCMA14, runMonteCarloRisk, anonymizeXER } from './dcmaEngine';
+import {
+  calculateDCMA14,
+  runMonteCarloRisk,
+  anonymizeXER,
+  defaultThresholds,
+  defaultRiskSettings,
+  resolveDataDate,
+} from './dcmaEngine';
 import { generateDetailedXER } from './sampleData';
 import { mentorTopics } from './scheduleMentorData';
-import type { ParsedXER, XERActivity, TimeChainageItem, MentorTopic } from './types';
+import type {
+  ParsedXER,
+  XERActivity,
+  MentorTopic,
+  DCMAThresholdConfig,
+  QSRARiskSettings,
+  MonteCarloResult,
+} from './types';
 import Chart from 'chart.js/auto';
+import { buildNetwork, solveCPM } from './cpm';
 
 let currentXER: ParsedXER | null = null;
 let riskChartInstance: Chart | null = null;
 let filteredActivities: XERActivity[] = [];
 let selectedMentorTopic: MentorTopic = mentorTopics[0];
+let thresholdConfig: DCMAThresholdConfig = structuredClone(defaultThresholds);
+let riskSettings: QSRARiskSettings = { ...defaultRiskSettings };
+let lastRiskResult: MonteCarloResult | null = null;
 
 // Viewer State
 let searchFilter = '';
@@ -17,10 +35,11 @@ let criticalOnly = false;
 let milestonesOnly = false;
 let maxFloatFilter: number | null = null;
 let wbsViewMode: 'grouped' | 'flat' = 'grouped';
-let expandedWBS = new Set<string>();
+let expandedWBS: Set<string> = new Set<string>();
 let zoomMode: 'Month' | 'Week' | 'Day' = 'Month';
 
 document.addEventListener('DOMContentLoaded', () => {
+  setupTheme();
   setupNavigation();
   setupFileUpload();
   setupViewerControls();
@@ -28,16 +47,41 @@ document.addEventListener('DOMContentLoaded', () => {
   loadSampleData();
 });
 
+function setupTheme() {
+  const toggle = document.getElementById('themeToggle');
+  const root = document.documentElement;
+
+  toggle?.addEventListener('click', () => {
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const current = root.getAttribute('data-theme') ?? (prefersDark ? 'dark' : 'light');
+    const next = current === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try {
+      localStorage.setItem('tppsci-theme', next);
+    } catch {
+      // Storage can be unavailable in private mode; the theme still applies.
+    }
+    // Chart.js bakes colours in at construction, so redraw against the new theme.
+    if (document.getElementById('tab-risk')?.style.display !== 'none') renderMonteCarlo();
+  });
+}
+
 function setupNavigation() {
   const tabs = document.querySelectorAll<HTMLButtonElement>('.tab-btn');
   tabs.forEach(tab => {
     tab.addEventListener('click', () => {
-      tabs.forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-
       const targetTab = tab.getAttribute('data-tab');
+
+      tabs.forEach(t => {
+        const isActive = t === tab;
+        t.classList.toggle('active', isActive);
+        t.setAttribute('aria-selected', String(isActive));
+      });
+
       document.querySelectorAll<HTMLElement>('.tab-content').forEach(section => {
-        section.style.display = section.id === `tab-${targetTab}` ? 'block' : 'none';
+        const show = section.id === `tab-${targetTab}`;
+        // The Gantt pane is a flex column; every other tab is a plain block.
+        section.style.display = show ? (targetTab === 'gantt' ? 'flex' : 'block') : 'none';
       });
     });
   });
@@ -71,14 +115,30 @@ function setupFileUpload() {
     fileInput.addEventListener('change', () => {
       if (fileInput.files?.length) {
         handleFile(fileInput.files[0]);
+        // Reset so re-selecting the same file still fires a change event.
+        fileInput.value = '';
       }
     });
   }
 
-  const exportAnonymizedBtn = document.getElementById('exportAnonymizedBtn');
-  if (exportAnonymizedBtn) {
-    exportAnonymizedBtn.addEventListener('click', exportAnonymizedFile);
-  }
+  document.getElementById('openXerBtn')?.addEventListener('click', () => fileInput?.click());
+
+  // Drag and drop anywhere in the window, so the user never hunts for a target.
+  window.addEventListener('dragover', e => {
+    e.preventDefault();
+    document.querySelector('.gantt-split-container')?.classList.add('dragover');
+  });
+  window.addEventListener('dragleave', () => {
+    document.querySelector('.gantt-split-container')?.classList.remove('dragover');
+  });
+  window.addEventListener('drop', e => {
+    e.preventDefault();
+    document.querySelector('.gantt-split-container')?.classList.remove('dragover');
+    const file = e.dataTransfer?.files?.[0];
+    if (file) handleFile(file);
+  });
+
+  document.getElementById('exportAnonymizedBtn')?.addEventListener('click', exportAnonymizedFile);
 }
 
 
@@ -192,17 +252,37 @@ function setupViewerControls() {
 }
 
 function handleFile(file: File) {
+  if (!file.name.toLowerCase().endsWith('.xer')) {
+    alert(`"${file.name}" is not a Primavera XER export. Choose a .xer file.`);
+    return;
+  }
+
   const reader = new FileReader();
-  reader.onload = (e) => {
+
+  reader.onerror = () => alert(`Could not read "${file.name}".`);
+
+  reader.onload = e => {
     const text = e.target?.result as string;
-    if (text) {
-      currentXER = parseXERText(text);
-      if (currentXER) {
-        currentXER.wbs.forEach(w => expandedWBS.add(w.wbs_id));
-      }
-      updateUI();
+    if (!text) return;
+
+    let parsed: ParsedXER;
+    try {
+      parsed = parseXERText(text);
+    } catch (err) {
+      alert(`Could not parse "${file.name}": ${err instanceof Error ? err.message : 'unknown error'}`);
+      return;
     }
+
+    if (!parsed.activities.length) {
+      alert(`"${file.name}" contains no TASK records — it may be a partial or non-project export.`);
+      return;
+    }
+
+    currentXER = parsed;
+    expandedWBS = new Set(parsed.wbs.map(w => w.wbs_id));
+    updateUI();
   };
+
   reader.readAsText(file);
 }
 
@@ -232,7 +312,7 @@ function applyFilters() {
     }
 
     if (criticalOnly && !a.is_critical) return false;
-    if (milestonesOnly && a.target_drtn_hr_cnt > 0) return false;
+    if (milestonesOnly && !a.is_milestone) return false;
 
     if (maxFloatFilter !== null) {
       const floatDays = a.total_float_hr_cnt / 8;
@@ -288,30 +368,34 @@ function renderGantt() {
 
   if (!tableBody || !barsContainer || !timelineHeader) return;
 
-  // Timeline scale setup
-  const minDate = new Date('2011-08-01');
-  const monthWidth = zoomMode === 'Month' ? 120 : 240;
-  const months = ['Aug-11', 'Sep-11', 'Oct-11', 'Nov-11', 'Dec-11', 'Jan-12'];
-
-  timelineHeader.innerHTML = months.map(m => `
-    <div class="timeline-month" style="width:${monthWidth}px;">${m}</div>
-  `).join('');
+  // Timeline scale is derived from the schedule itself rather than fixed dates,
+  // so any loaded XER lands on a timeline that actually contains its bars.
+  const scale = buildTimeScale(currentXER.activities);
+  timelineHeader.innerHTML = scale.columns
+    .map(c => `<div class="timeline-month" style="width:${c.width}px;">${c.label}</div>`)
+    .join('');
+  timelineHeader.style.width = `${scale.totalWidth}px`;
 
   let tableHtml = '';
   let barsHtml = '';
   let rowIdx = 0;
 
-  // Data date line
-  barsHtml += `
-    <div class="gantt-data-date-line" style="left:5px;">
-      <span class="gantt-data-date-label">Data date 01-Aug-11</span>
-    </div>
-  `;
+  const dataDate = resolveDataDate(currentXER);
+  if (dataDate) {
+    const left = scale.xFor(dataDate);
+    if (left >= 0 && left <= scale.totalWidth) {
+      barsHtml += `
+        <div class="gantt-data-date-line" style="left:${left}px;">
+          <span class="gantt-data-date-label">Data date ${formatDate(dataDate.toISOString())}</span>
+        </div>
+      `;
+    }
+  }
 
   if (wbsViewMode === 'flat') {
     filteredActivities.forEach(a => {
       tableHtml += renderTableRow(a);
-      barsHtml += renderBarRow(a, rowIdx, minDate, monthWidth);
+      barsHtml += renderBarRow(a, scale);
       rowIdx++;
     });
   } else {
@@ -338,9 +422,11 @@ function renderGantt() {
         </tr>
       `;
 
+      // The summary bar spans its children's real extent, not a fixed width.
+      const wbsSpan = spanOf(wbsActivities, scale);
       barsHtml += `
         <div class="gantt-row-container">
-          <div class="gantt-bar-item wbs-summary" style="left:10px; width:${Math.min(250, wbsActivities.length * 40)}px;"></div>
+          ${wbsSpan ? `<div class="gantt-bar-item wbs-summary" style="left:${wbsSpan.left}px; width:${wbsSpan.width}px;"></div>` : ''}
         </div>
       `;
       rowIdx++;
@@ -348,7 +434,7 @@ function renderGantt() {
       if (isExpanded) {
         wbsActivities.forEach(a => {
           tableHtml += renderTableRow(a);
-          barsHtml += renderBarRow(a, rowIdx, minDate, monthWidth);
+          barsHtml += renderBarRow(a, scale);
           rowIdx++;
         });
       }
@@ -357,6 +443,7 @@ function renderGantt() {
 
   tableBody.innerHTML = tableHtml;
   barsContainer.innerHTML = barsHtml;
+  barsContainer.style.width = `${scale.totalWidth}px`;
 
   // Add click listeners to toggle WBS expansion
   document.querySelectorAll('.wbs-row').forEach(row => {
@@ -375,43 +462,160 @@ function renderGantt() {
 }
 
 function renderTableRow(a: XERActivity): string {
-  const startDate = a.early_start_date ? formatDate(a.early_start_date) : '-';
-  const endDate = a.early_end_date ? formatDate(a.early_end_date) : '-';
+  const { start, end } = activityDates(a);
+  const code = escapeHtml(a.task_code);
+  const name = escapeHtml(a.task_name);
 
   return `
     <tr class="task-row ${a.is_critical ? 'critical' : ''}">
-      <td title="${a.task_code}">${a.task_code}</td>
-      <td title="${a.task_name}">${a.task_name}</td>
-      <td>${startDate}</td>
-      <td>${endDate}</td>
+      <td title="${code}">${code}</td>
+      <td title="${name}">${name}</td>
+      <td>${start ? formatDate(start.toISOString()) : '—'}</td>
+      <td>${end ? formatDate(end.toISOString()) : '—'}</td>
     </tr>
   `;
 }
 
-function renderBarRow(a: XERActivity, _rowIdx: number, baseDate: Date, monthWidth: number): string {
-  const startDate = a.early_start_date ? new Date(a.early_start_date) : baseDate;
-  const endDate = a.early_end_date ? new Date(a.early_end_date) : new Date(startDate.getTime() + 86400000);
+interface TimeScale {
+  start: Date;
+  end: Date;
+  pxPerDay: number;
+  totalWidth: number;
+  columns: { label: string; width: number }[];
+  xFor: (d: Date) => number;
+}
 
-  const daysFromStart = Math.max(0, (startDate.getTime() - baseDate.getTime()) / (1000 * 3600 * 24));
-  const durationDays = Math.max(1, (endDate.getTime() - startDate.getTime()) / (1000 * 3600 * 24));
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const DAY_MS = 24 * 3600 * 1000;
 
-  // Scale: 30 days = monthWidth pixels
-  const leftPx = (daysFromStart / 30) * monthWidth + 5;
-  const widthPx = Math.max(8, (durationDays / 30) * monthWidth);
+function activityDates(a: XERActivity): { start: Date | null; end: Date | null } {
+  const pick = (...values: (string | undefined)[]) => {
+    for (const v of values) {
+      if (!v) continue;
+      const d = new Date(v.replace(' ', 'T'));
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+    return null;
+  };
+  const start = pick(a.act_start_date, a.early_start_date, a.target_start_date);
+  const end = pick(a.act_end_date, a.early_end_date, a.target_end_date);
+  return { start, end: end ?? start };
+}
 
-  if (a.target_drtn_hr_cnt === 0) {
+/**
+ * Builds a month/week/day column set covering the whole schedule, padded by a
+ * few days so bars at the extremes are not flush against the pane edges.
+ */
+function buildTimeScale(activities: XERActivity[]): TimeScale {
+  let min: number | null = null;
+  let max: number | null = null;
+  for (const a of activities) {
+    const { start, end } = activityDates(a);
+    if (start) min = min === null ? start.getTime() : Math.min(min, start.getTime());
+    if (end) max = max === null ? end.getTime() : Math.max(max, end.getTime());
+  }
+
+  const today = Date.now();
+  const startMs = (min ?? today) - 3 * DAY_MS;
+  const endMs = Math.max(max ?? today, startMs + 30 * DAY_MS) + 3 * DAY_MS;
+
+  const start = new Date(startMs);
+  const end = new Date(endMs);
+
+  const pxPerDay = zoomMode === 'Day' ? 24 : zoomMode === 'Week' ? 8 : 4;
+  const totalDays = Math.ceil((endMs - startMs) / DAY_MS);
+  const totalWidth = Math.max(600, totalDays * pxPerDay);
+  const xFor = (d: Date) => ((d.getTime() - startMs) / DAY_MS) * pxPerDay;
+
+  const columns: { label: string; width: number }[] = [];
+  if (zoomMode === 'Day') {
+    for (let t = startMs; t < endMs; t += DAY_MS) {
+      const d = new Date(t);
+      columns.push({ label: `${d.getDate()}`, width: pxPerDay });
+    }
+  } else if (zoomMode === 'Week') {
+    // Snap the first column back to the Monday containing the schedule start.
+    const cursor = new Date(startMs);
+    cursor.setDate(cursor.getDate() - ((cursor.getDay() + 6) % 7));
+    while (cursor.getTime() < endMs) {
+      const next = new Date(cursor.getTime() + 7 * DAY_MS);
+      const from = Math.max(cursor.getTime(), startMs);
+      const to = Math.min(next.getTime(), endMs);
+      columns.push({
+        label: `${cursor.getDate()} ${MONTH_NAMES[cursor.getMonth()]}`,
+        width: ((to - from) / DAY_MS) * pxPerDay,
+      });
+      cursor.setTime(next.getTime());
+    }
+  } else {
+    const cursor = new Date(start.getFullYear(), start.getMonth(), 1);
+    while (cursor.getTime() < endMs) {
+      const next = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
+      const from = Math.max(cursor.getTime(), startMs);
+      const to = Math.min(next.getTime(), endMs);
+      columns.push({
+        label: `${MONTH_NAMES[cursor.getMonth()]}-${String(cursor.getFullYear()).slice(2)}`,
+        width: ((to - from) / DAY_MS) * pxPerDay,
+      });
+      cursor.setTime(next.getTime());
+    }
+  }
+
+  return { start, end, pxPerDay, totalWidth, columns, xFor };
+}
+
+function spanOf(activities: XERActivity[], scale: TimeScale): { left: number; width: number } | null {
+  let min: number | null = null;
+  let max: number | null = null;
+  for (const a of activities) {
+    const { start, end } = activityDates(a);
+    if (start) min = min === null ? start.getTime() : Math.min(min, start.getTime());
+    if (end) max = max === null ? end.getTime() : Math.max(max, end.getTime());
+  }
+  if (min === null || max === null) return null;
+  const left = scale.xFor(new Date(min));
+  return { left, width: Math.max(4, scale.xFor(new Date(max)) - left) };
+}
+
+function renderBarRow(a: XERActivity, scale: TimeScale): string {
+  const { start, end } = activityDates(a);
+  if (!start) return '<div class="gantt-row-container"></div>';
+
+  const leftPx = scale.xFor(start);
+  const tooltip = `${a.task_code} — ${a.task_name}`;
+
+  if (a.is_milestone) {
     return `
       <div class="gantt-row-container">
-        <div class="gantt-milestone-diamond ${a.is_critical ? 'critical' : ''}" style="left:${leftPx}px;"></div>
+        <div class="gantt-milestone-diamond ${a.is_critical ? 'critical' : ''}" style="left:${leftPx}px;" title="${escapeHtml(tooltip)}"></div>
       </div>
     `;
   }
 
+  const rightPx = scale.xFor(end ?? start);
+  const widthPx = Math.max(3, rightPx - leftPx);
+
+  // Progressed work is drawn as a filled portion of the same bar.
+  const progress =
+    a.status_code === 'TK_Complete'
+      ? 1
+      : a.target_drtn_hr_cnt > 0
+        ? Math.min(1, Math.max(0, 1 - a.remain_drtn_hr_cnt / a.target_drtn_hr_cnt))
+        : 0;
+
   return `
     <div class="gantt-row-container">
-      <div class="gantt-bar-item ${a.is_critical ? 'critical' : ''}" style="left:${leftPx}px; width:${widthPx}px;"></div>
+      <div class="gantt-bar-item ${a.is_critical ? 'critical' : ''}" style="left:${leftPx}px; width:${widthPx}px;" title="${escapeHtml(tooltip)}">
+        ${progress > 0 ? `<div class="gantt-bar-progress" style="width:${(progress * 100).toFixed(1)}%"></div>` : ''}
+      </div>
     </div>
   `;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, ch =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]!,
+  );
 }
 
 function formatDate(dateStr: string): string {
@@ -444,33 +648,31 @@ function setupScheduleMentor() {
 
   const categories: MentorTopic['category'][] = ['Logic', 'Constraints', 'Calendars & durations', 'Progress', 'Structure'];
 
-  let html = '';
-  categories.forEach(cat => {
-    const topics = mentorTopics.filter(t => t.category === cat);
-    html += `<div style="margin-bottom:1.25rem;">
-      <div style="font-size:0.8rem; font-weight:700; color:var(--text-muted); text-transform:uppercase; margin-bottom:0.5rem; letter-spacing:0.5px;">${cat}</div>
-      <div style="display:flex; flex-direction:column; gap:0.25rem;">`;
+  sidebar.innerHTML = categories
+    .map(cat => {
+      const topics = mentorTopics.filter(t => t.category === cat);
+      if (!topics.length) return '';
+      return `
+        <div style="margin-bottom:16px;">
+          <div class="stat-label" style="margin-bottom:6px;">${escapeHtml(cat)}</div>
+          <div style="display:flex; flex-direction:column; gap:2px;">
+            ${topics.map(t => `
+              <button class="mentor-topic-btn ${t.id === selectedMentorTopic.id ? 'active' : ''}" data-id="${t.id}">
+                <span class="code-chip">${escapeHtml(t.code)}</span>
+                <span>${escapeHtml(t.title)}</span>
+              </button>
+            `).join('')}
+          </div>
+        </div>`;
+    })
+    .join('');
 
-    topics.forEach(t => {
-      html += `<button class="mentor-topic-btn ${t.id === selectedMentorTopic.id ? 'active' : ''}" data-id="${t.id}" style="text-align:left; background:transparent; border:none; color:var(--text-main); padding:0.4rem 0.6rem; border-radius:4px; cursor:pointer; font-size:0.9rem; display:flex; align-items:center; gap:0.5rem;">
-        <span style="background:#cbd5e1; color:#0f172a; font-size:0.75rem; font-weight:700; padding:0.1rem 0.4rem; border-radius:4px;">${t.code}</span>
-        <span>${t.title}</span>
-      </button>`;
-    });
-
-    html += `</div></div>`;
-  });
-
-  sidebar.innerHTML = html;
-
-  sidebar.querySelectorAll('.mentor-topic-btn').forEach(btn => {
+  sidebar.querySelectorAll<HTMLButtonElement>('.mentor-topic-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      const id = btn.getAttribute('data-id');
-      const topic = mentorTopics.find(t => t.id === id);
+      const topic = mentorTopics.find(t => t.id === btn.dataset.id);
       if (topic) {
         selectedMentorTopic = topic;
         setupScheduleMentor();
-        renderScheduleMentorContent();
       }
     });
   });
@@ -482,200 +684,173 @@ function renderScheduleMentorContent() {
   const content = document.getElementById('mentorContent');
   if (!content || !selectedMentorTopic) return;
 
-  let affectedTasks: XERActivity[] = [];
-  if (currentXER) {
-    affectedTasks = selectedMentorTopic.getAffectedTasks(currentXER.activities, currentXER.relationships);
-  }
+  const topic = selectedMentorTopic;
+  const affected = currentXER ? topic.getAffectedTasks(currentXER.activities, currentXER.relationships) : [];
+  const hpd = thresholdConfig.hoursPerDay;
 
   content.innerHTML = `
-    <div>
-      <div style="display:flex; align-items:center; gap:0.75rem; margin-bottom:1rem;">
-        <span style="background:#2563eb; color:#fff; font-size:0.9rem; font-weight:800; padding:0.2rem 0.6rem; border-radius:6px;">${selectedMentorTopic.code}</span>
-        <h2 style="font-size:1.6rem; font-weight:800; color:var(--text-main)">${selectedMentorTopic.title}</h2>
+    <div class="section-head">
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span class="badge-count badge-na" style="font-family:var(--font-mono)">${escapeHtml(topic.code)}</span>
+        <h2>${escapeHtml(topic.title)}</h2>
       </div>
+    </div>
 
-      <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap:1.25rem; margin-bottom:1.5rem;">
-        <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:1.25rem;">
-          <h4 style="color:#dc2626; margin-bottom:0.5rem;">💡 Why it matters</h4>
-          <p style="color:var(--text-muted); font-size:0.92rem; line-height:1.6">${selectedMentorTopic.whyItMatters}</p>
-        </div>
+    <div class="two-col" style="margin-bottom:16px;">
+      <div class="card"><h3 style="color:var(--red)">Why it matters</h3><p class="muted">${escapeHtml(topic.whyItMatters)}</p></div>
+      <div class="card"><h3 style="color:var(--accent)">How to fix it in P6</h3><p class="muted">${escapeHtml(topic.howToFixInP6)}</p></div>
+      <div class="card"><h3 style="color:var(--green)">When it is actually fine</h3><p class="muted">${escapeHtml(topic.whenItsFine)}</p></div>
+    </div>
 
-        <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:1.25rem;">
-          <h4 style="color:#2563eb; margin-bottom:0.5rem;">🔧 How to fix it in P6</h4>
-          <p style="color:var(--text-muted); font-size:0.92rem; line-height:1.6">${selectedMentorTopic.howToFixInP6}</p>
-        </div>
-
-        <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:1.25rem;">
-          <h4 style="color:#10b981; margin-bottom:0.5rem;">✅ When it’s actually fine</h4>
-          <p style="color:var(--text-muted); font-size:0.92rem; line-height:1.6">${selectedMentorTopic.whenItsFine}</p>
-        </div>
+    <div class="card">
+      <div class="section-head">
+        <h3>Affected activities in the loaded schedule (${affected.length})</h3>
+        ${affected.length ? '<button class="pill-btn" id="mentorExportBtn">Export list</button>' : ''}
       </div>
-
-      <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:1.25rem;">
-        <div style="display:flex; justify-space-between:space-between; align-items:center; margin-bottom:0.75rem;">
-          <h3 style="font-size:1rem; font-weight:700">Detected Affected Tasks in Your Schedule (${affectedTasks.length})</h3>
-        </div>
-
-        ${affectedTasks.length === 0 ? `
-          <p style="color:var(--text-muted);">No activities in your loaded schedule violate this mentor rule.</p>
-        ` : `
-          <div class="table-responsive">
-            <table class="gantt-table">
-              <thead>
-                <tr>
-                  <th>Activity ID</th>
-                  <th>Activity Description</th>
-                  <th>Duration</th>
-                  <th>Total Float</th>
-                </tr>
-              </thead>
+      ${affected.length === 0
+        ? '<p class="muted">Nothing in the loaded schedule violates this rule.</p>'
+        : `<div class="table-responsive" style="max-height:420px;">
+            <table class="data-table">
+              <thead><tr><th>Activity ID</th><th>Activity name</th><th>Duration (d)</th><th>Total float (d)</th></tr></thead>
               <tbody>
-                ${affectedTasks.map(a => `
+                ${affected.slice(0, 500).map(a => `
                   <tr>
-                    <td><strong>${a.task_code}</strong></td>
-                    <td>${a.task_name}</td>
-                    <td>${(a.target_drtn_hr_cnt / 8).toFixed(1)} d</td>
-                    <td>${(a.total_float_hr_cnt / 8).toFixed(1)} d</td>
-                  </tr>
-                `).join('')}
+                    <td><strong>${escapeHtml(a.task_code)}</strong></td>
+                    <td>${escapeHtml(a.task_name)}</td>
+                    <td>${(a.target_drtn_hr_cnt / hpd).toFixed(1)}</td>
+                    <td>${(a.total_float_hr_cnt / hpd).toFixed(1)}</td>
+                  </tr>`).join('')}
               </tbody>
             </table>
           </div>
-        `}
-      </div>
+          ${affected.length > 500 ? '<p class="muted">Showing the first 500; export for the full list.</p>' : ''}`}
     </div>
   `;
+
+  document.getElementById('mentorExportBtn')?.addEventListener('click', () => {
+    const rows = [['Activity ID', 'Activity name', 'Duration (d)', 'Total float (d)']];
+    affected.forEach(a => rows.push([
+      a.task_code, a.task_name,
+      (a.target_drtn_hr_cnt / hpd).toFixed(1),
+      (a.total_float_hr_cnt / hpd).toFixed(1),
+    ]));
+    downloadCSV(rows, `mentor-${topic.code}.csv`);
+  });
+}
+
+
+function ragLabel(rag: string): string {
+  return rag === 'na' ? 'N/A' : rag.charAt(0).toUpperCase() + rag.slice(1);
+}
+
+function formatMetricValue(m: { unit: string; value: number; rag: string }): string {
+  if (m.rag === 'na') return '—';
+  if (m.unit === 'percent') return `${m.value.toFixed(1)}%`;
+  if (m.unit === 'ratio') return m.value.toFixed(2);
+  return String(m.value);
 }
 
 function renderDCMA() {
   if (!currentXER) return;
-  const report = calculateDCMA14(currentXER);
+  const report = calculateDCMA14(currentXER, thresholdConfig);
 
   const container = document.getElementById('tab-dcma');
   if (!container) return;
 
-  const greenCount = report.metrics.filter(m => m.passed).length;
-  const redCount = report.metrics.filter(m => !m.passed && m.total > 0).length;
-  const naCount = report.metrics.filter(m => m.total === 0).length;
-  const amberCount = 0;
-
   container.innerHTML = `
-    <!-- Top Metadata Summary Banner -->
+    <div class="section-head">
+      <div>
+        <h2>DCMA 14-point assessment</h2>
+        <p class="section-sub">
+          Every check below is computed from the schedule currently loaded. Checks that cannot be
+          evaluated from a single XER are reported as N/A with the reason, rather than silently passed.
+        </p>
+      </div>
+      <div class="section-actions">
+        <button class="pill-btn" id="openThresholdsBtn">Thresholds &amp; settings</button>
+        <button class="pill-btn" id="exportDcmaCsvBtn">Export CSV</button>
+      </div>
+    </div>
+
     <div class="dcma-header-summary">
       <div class="dcma-meta-grid">
-        <div class="dcma-meta-item">
-          <strong>Project</strong>
-          <span style="font-size:14px; font-weight:700">${report.projectName}</span>
-        </div>
-        <div class="dcma-meta-item">
-          <strong>Project ID</strong>
-          <span>${report.projectCode}</span>
-        </div>
-        <div class="dcma-meta-item">
-          <strong>Data date</strong>
-          <span>01-Aug-2011</span>
-        </div>
-        <div class="dcma-meta-item">
-          <strong>Activities</strong>
-          <span>${report.activityCount} (${report.activityCount} inc)</span>
-        </div>
-        <div class="dcma-meta-item">
-          <strong>Relationships</strong>
-          <span>${report.relationshipCount}</span>
-        </div>
-        <div class="dcma-meta-item">
-          <strong>Excluded</strong>
-          <span>0</span>
-        </div>
+        <div class="dcma-meta-item"><strong>Project</strong><span>${escapeHtml(report.projectName)}</span></div>
+        <div class="dcma-meta-item"><strong>Project ID</strong><span>${escapeHtml(report.projectCode)}</span></div>
+        <div class="dcma-meta-item"><strong>Data date</strong><span>${report.dataDate ? formatDate(report.dataDate.toISOString()) : 'not stated'}</span></div>
+        <div class="dcma-meta-item"><strong>Activities</strong><span>${report.activityCount} (${report.incompleteCount} incomplete)</span></div>
+        <div class="dcma-meta-item"><strong>Relationships</strong><span>${report.relationshipCount}</span></div>
+        <div class="dcma-meta-item"><strong>Health score</strong><span class="score-value">${report.overallScore}%</span></div>
       </div>
 
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <div class="dcma-score-badges">
-          <span class="badge-count badge-green">${greenCount} Green</span>
-          <span class="badge-count badge-amber">${amberCount} Amber</span>
-          <span class="badge-count badge-red">${redCount} Red</span>
-          <span class="badge-count badge-na">${naCount} N/A</span>
-        </div>
-
-        <div style="display:flex; gap:8px;">
-          <button class="pill-btn" id="openThresholdsBtn">⚙ Thresholds & settings</button>
-          <button class="pill-btn">📋 Baseline…</button>
-          <button class="pill-btn">Report / Print</button>
-        </div>
+      <div class="dcma-score-badges">
+        <span class="badge-count badge-green">${report.greenCount} Green</span>
+        <span class="badge-count badge-amber">${report.amberCount} Amber</span>
+        <span class="badge-count badge-red">${report.redCount} Red</span>
+        <span class="badge-count badge-na">${report.naCount} N/A</span>
       </div>
     </div>
 
-    <!-- 14 DCMA Check Cards Grid -->
     <div class="dcma-cards-grid">
-      ${report.metrics.map(m => {
-        const isNA = m.total === 0;
-        const ragLabel = isNA ? 'N/A' : m.passed ? 'Green' : 'Red';
-        const ragClass = isNA ? 'badge-na' : m.passed ? 'badge-green' : 'badge-red';
-        const metricVal = isNA ? '—' : m.percentage > 0 ? `${m.percentage.toFixed(1)}%` : `${m.count}`;
-
-        return `
-          <div class="dcma-card">
+      ${report.metrics.map(m => `
+        <div class="dcma-card rag-${m.rag}" data-check="${m.id}" tabindex="0" role="button"
+             aria-label="Check ${m.id} ${escapeHtml(m.name)}, ${ragLabel(m.rag)}">
+          <div class="dcma-card-header">
             <div>
-              <div class="dcma-card-header">
-                <div>
-                  <span class="dcma-card-check-no">Check ${m.id}</span>
-                  <div class="dcma-card-title">${m.name}</div>
-                </div>
-                <span class="dcma-card-rag ${ragClass}">${ragLabel}</span>
-              </div>
-              <div class="dcma-card-metric">${metricVal}</div>
+              <span class="dcma-card-check-no">Check ${m.id}</span>
+              <div class="dcma-card-title">${escapeHtml(m.name)}</div>
             </div>
-            <div class="dcma-card-desc">
-              ${isNA ? 'Not assessed' : `${m.count} of ${m.total} incomplete activities`}
-            </div>
+            <span class="dcma-card-rag badge-${m.rag}">${ragLabel(m.rag)}</span>
           </div>
-        `;
-      }).join('')}
+          <div class="dcma-card-metric">${formatMetricValue(m)}</div>
+          <div class="dcma-card-desc">
+            ${m.notAssessedReason
+              ? escapeHtml(m.notAssessedReason)
+              : `${escapeHtml(m.description)}<br><span class="muted">${m.unit === 'ratio' ? `Target ${escapeHtml(m.target)}` : `${m.count} of ${m.total} · target ${escapeHtml(m.target)}`}</span>`}
+          </div>
+          ${m.flaggedTasks.length ? `<div class="dcma-card-cta">${m.flaggedTasks.length} flagged activities — view</div>` : ''}
+        </div>
+      `).join('')}
     </div>
 
-    <!-- Thresholds Modal Dialog -->
-    <div id="thresholdsModal" class="modal-overlay" style="display:none;">
+    <div id="dcmaDrilldown" class="card" style="display:none;"></div>
+
+    <div id="thresholdsModal" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-label="Thresholds and settings">
       <div class="modal-card">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-          <h3 style="font-size:18px; font-weight:700">Thresholds & settings</h3>
-          <button id="closeThresholdsModalBtn" style="background:transparent; border:none; font-size:20px; cursor:pointer;">×</button>
+        <div class="modal-head">
+          <h3>Thresholds &amp; settings</h3>
+          <button id="closeThresholdsModalBtn" class="icon-btn" aria-label="Close">&times;</button>
         </div>
 
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;">
-          <div>
-            <label style="font-weight:600; font-size:12px">Profile name</label>
-            <input type="text" class="text-input" value="DCMA defaults" style="width:100%; margin-top:4px;" />
-          </div>
-          <div>
-            <label style="font-weight:600; font-size:12px">Hours per day (divisor)</label>
-            <input type="number" class="number-input" value="8" style="width:100%; margin-top:4px;" />
-          </div>
+        <div class="form-grid-3">
+          <label>Profile name
+            <input type="text" class="text-input" id="thProfileName" value="${escapeHtml(thresholdConfig.profileName)}" />
+          </label>
+          <label>Hours per day
+            <input type="number" class="number-input" id="thHoursPerDay" min="1" max="24" value="${thresholdConfig.hoursPerDay}" />
+          </label>
+          <label>High float / duration horizon (wd)
+            <input type="number" class="number-input" id="thHorizon" min="1" value="${thresholdConfig.highFloatHorizonDays}" />
+          </label>
         </div>
 
         <table class="threshold-table">
           <thead>
-            <tr>
-              <th>Check</th>
-              <th>Unit</th>
-              <th>Green Target</th>
-              <th>Amber Target</th>
-              <th>Action</th>
-            </tr>
+            <tr><th>Check</th><th>Unit</th><th>Green</th><th>Amber</th></tr>
           </thead>
           <tbody>
             ${report.metrics.map(m => `
               <tr>
-                <td><strong>${m.id}. ${m.name}</strong></td>
-                <td>${m.id === 13 || m.id === 14 ? 'decimal' : m.target.includes('%') ? 'percent' : 'count'}</td>
-                <td><input type="number" value="${m.id === 4 ? 90 : m.id === 13 || m.id === 14 ? 0.95 : 5}" /></td>
-                <td><input type="number" value="${m.id === 4 ? 80 : m.id === 13 || m.id === 14 ? 0.9 : 10}" /></td>
-                <td><button class="pill-btn" style="padding:2px 8px; font-size:11px">Reset</button></td>
+                <td><strong>${m.id}. ${escapeHtml(m.name)}</strong></td>
+                <td>${m.unit}</td>
+                <td><input type="number" step="0.01" data-band="green" data-check="${m.id}" value="${thresholdConfig.ragBands[m.id].green}" /></td>
+                <td><input type="number" step="0.01" data-band="amber" data-check="${m.id}" value="${thresholdConfig.ragBands[m.id].amber}" /></td>
               </tr>
             `).join('')}
           </tbody>
         </table>
 
-        <div style="margin-top:20px; display:flex; justify-content:flex-end; gap:8px;">
+        <div class="modal-actions">
+          <button class="pill-btn" id="resetThresholdsBtn">Reset to DCMA defaults</button>
           <button class="pill-btn" id="cancelThresholdsBtn">Cancel</button>
           <button class="pill-btn active" id="applyThresholdsBtn">Apply</button>
         </div>
@@ -683,57 +858,239 @@ function renderDCMA() {
     </div>
   `;
 
-  // Attach Modal Listeners
-  const openBtn = document.getElementById('openThresholdsBtn');
   const modal = document.getElementById('thresholdsModal');
-  const closeBtn = document.getElementById('closeThresholdsModalBtn');
-  const cancelBtn = document.getElementById('cancelThresholdsBtn');
-  const applyBtn = document.getElementById('applyThresholdsBtn');
+  const closeModal = () => { if (modal) modal.style.display = 'none'; };
 
-  if (openBtn && modal) {
-    openBtn.addEventListener('click', () => { modal.style.display = 'flex'; });
-  }
+  document.getElementById('openThresholdsBtn')?.addEventListener('click', () => {
+    if (modal) modal.style.display = 'flex';
+  });
+  document.getElementById('closeThresholdsModalBtn')?.addEventListener('click', closeModal);
+  document.getElementById('cancelThresholdsBtn')?.addEventListener('click', closeModal);
+  modal?.addEventListener('click', e => { if (e.target === modal) closeModal(); });
 
-  if (closeBtn && modal) {
-    closeBtn.addEventListener('click', () => { modal.style.display = 'none'; });
-  }
+  document.getElementById('resetThresholdsBtn')?.addEventListener('click', () => {
+    thresholdConfig = structuredClone(defaultThresholds);
+    renderDCMA();
+  });
 
-  if (cancelBtn && modal) {
-    cancelBtn.addEventListener('click', () => { modal.style.display = 'none'; });
-  }
+  document.getElementById('applyThresholdsBtn')?.addEventListener('click', () => {
+    const profile = (document.getElementById('thProfileName') as HTMLInputElement)?.value;
+    const hours = parseFloat((document.getElementById('thHoursPerDay') as HTMLInputElement)?.value);
+    const horizon = parseFloat((document.getElementById('thHorizon') as HTMLInputElement)?.value);
 
-  if (applyBtn && modal) {
-    applyBtn.addEventListener('click', () => {
-      modal.style.display = 'none';
-      alert('Custom DCMA thresholds applied!');
-      renderDCMA();
+    if (profile) thresholdConfig.profileName = profile;
+    if (Number.isFinite(hours) && hours > 0) thresholdConfig.hoursPerDay = hours;
+    if (Number.isFinite(horizon) && horizon > 0) {
+      thresholdConfig.highFloatHorizonDays = horizon;
+      thresholdConfig.highDurationHorizonDays = horizon;
+    }
+
+    modal?.querySelectorAll<HTMLInputElement>('input[data-check]').forEach(input => {
+      const id = Number(input.dataset.check);
+      const band = input.dataset.band as 'green' | 'amber';
+      const value = parseFloat(input.value);
+      if (Number.isFinite(value) && thresholdConfig.ragBands[id]) {
+        thresholdConfig.ragBands[id][band] = value;
+      }
     });
-  }
+
+    closeModal();
+    // Thresholds feed the risk engine's day divisor too, so refresh both tabs.
+    riskSettings.hoursPerDay = thresholdConfig.hoursPerDay;
+    renderDCMA();
+    renderMonteCarlo();
+  });
+
+  document.getElementById('exportDcmaCsvBtn')?.addEventListener('click', () => {
+    const rows = [['Check', 'Name', 'Value', 'Unit', 'Target', 'RAG', 'Flagged', 'Total', 'Note']];
+    report.metrics.forEach(m => {
+      rows.push([
+        String(m.id), m.name, formatMetricValue(m), m.unit, m.target,
+        ragLabel(m.rag), String(m.count), String(m.total), m.notAssessedReason || '',
+      ]);
+    });
+    downloadCSV(rows, `dcma-14-point-${report.projectCode}.csv`);
+  });
+
+  const drilldown = document.getElementById('dcmaDrilldown');
+  container.querySelectorAll<HTMLElement>('.dcma-card').forEach(card => {
+    const show = () => {
+      const id = Number(card.dataset.check);
+      const metric = report.metrics.find(m => m.id === id);
+      if (!metric || !drilldown) return;
+
+      if (!metric.flaggedTasks.length) {
+        drilldown.style.display = 'block';
+        drilldown.innerHTML = `<h3>Check ${metric.id} — ${escapeHtml(metric.name)}</h3>
+          <p class="muted">${escapeHtml(metric.notAssessedReason || 'No activities are flagged by this check.')}</p>`;
+        return;
+      }
+
+      drilldown.style.display = 'block';
+      drilldown.innerHTML = `
+        <div class="section-head">
+          <h3>Check ${metric.id} — ${escapeHtml(metric.name)} (${metric.flaggedTasks.length} activities)</h3>
+          <button class="pill-btn" id="dcmaDrilldownCsv">Export list</button>
+        </div>
+        <div class="table-responsive" style="max-height:340px;">
+          <table class="data-table">
+            <thead><tr><th>Activity ID</th><th>Name</th><th>Status</th><th>Duration (d)</th><th>Total float (d)</th></tr></thead>
+            <tbody>
+              ${metric.flaggedTasks.slice(0, 500).map(a => `
+                <tr>
+                  <td><strong>${escapeHtml(a.task_code)}</strong></td>
+                  <td>${escapeHtml(a.task_name)}</td>
+                  <td>${a.status_code.replace('TK_', '')}</td>
+                  <td>${(a.target_drtn_hr_cnt / thresholdConfig.hoursPerDay).toFixed(1)}</td>
+                  <td>${(a.total_float_hr_cnt / thresholdConfig.hoursPerDay).toFixed(1)}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+        ${metric.flaggedTasks.length > 500 ? '<p class="muted">Showing the first 500; export the list for the full set.</p>' : ''}
+      `;
+      drilldown.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+      document.getElementById('dcmaDrilldownCsv')?.addEventListener('click', () => {
+        const rows = [['Activity ID', 'Name', 'Status', 'Duration (d)', 'Total float (d)']];
+        metric.flaggedTasks.forEach(a => rows.push([
+          a.task_code, a.task_name, a.status_code,
+          (a.target_drtn_hr_cnt / thresholdConfig.hoursPerDay).toFixed(1),
+          (a.total_float_hr_cnt / thresholdConfig.hoursPerDay).toFixed(1),
+        ]));
+        downloadCSV(rows, `dcma-check-${metric.id}.csv`);
+      });
+    };
+
+    card.addEventListener('click', show);
+    card.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); show(); }
+    });
+  });
+}
+
+/** Quotes every field so embedded commas, quotes and newlines survive Excel. */
+function downloadCSV(rows: string[][], filename: string) {
+  const csv = rows.map(r => r.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\r\n');
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 
 
 function renderPathAnalyser() {
   if (!currentXER) return;
-  const pathContainer = document.getElementById('pathAnalyserContainer');
-  if (!pathContainer) return;
+  const container = document.getElementById('pathAnalyserContainer');
+  if (!container) return;
 
-  const activities = currentXER.activities;
-  const criticalPath = activities.filter(a => a.is_critical);
+  const xer = currentXER;
+  const network = buildNetwork(xer.activities, xer.relationships);
+  const cpm = solveCPM(network);
+  const hpd = thresholdConfig.hoursPerDay;
 
-  pathContainer.innerHTML = `
-    <div style="display:flex; flex-direction:column; gap:0.75rem;">
-      <p style="color:var(--text-muted)">Critical Path Sequence (Longest Path Traversal):</p>
-      <div style="display:flex; flex-wrap:wrap; gap:0.5rem; align-items:center;">
-        ${criticalPath.map((a, idx) => `
-          <div style="background:#f8fafc; border:1px solid #dc2626; padding:0.5rem 0.75rem; border-radius:6px;">
-            <strong style="color:#dc2626">${a.task_code}</strong>: ${a.task_name} (${(a.target_drtn_hr_cnt / 8).toFixed(0)}d)
-          </div>
-          ${idx < criticalPath.length - 1 ? '<span style="color:var(--text-muted)">➔</span>' : ''}
-        `).join('')}
+  // Walk the driving chain backwards from the last-finishing activity: at each
+  // step take the predecessor that actually sets this activity's early start.
+  const path: number[] = [];
+  let cursor = -1;
+  let latest = -Infinity;
+  for (let i = 0; i < network.ids.length; i++) {
+    if (cpm.earlyFinish[i] > latest) { latest = cpm.earlyFinish[i]; cursor = i; }
+  }
+
+  const visited = new Set<number>();
+  while (cursor >= 0 && !visited.has(cursor)) {
+    visited.add(cursor);
+    path.push(cursor);
+
+    let driver = -1;
+    let driverFinish = -Infinity;
+    for (const e of network.preds[cursor]) {
+      // Only a predecessor whose own finish equals this start is truly driving.
+      const contributes = e.type === 'PR_SS' || e.type === 'PR_SF'
+        ? cpm.earlyStart[e.pred] + e.lag
+        : cpm.earlyFinish[e.pred] + e.lag;
+      if (Math.abs(contributes - cpm.earlyStart[cursor]) < 1e-6 && cpm.earlyFinish[e.pred] > driverFinish) {
+        driver = e.pred;
+        driverFinish = cpm.earlyFinish[e.pred];
+      }
+    }
+    cursor = driver;
+  }
+  path.reverse();
+
+  const totalDays = cpm.projectDuration / hpd;
+
+  container.innerHTML = `
+    <div class="section-head">
+      <div>
+        <h2>Longest path analyser</h2>
+        <p class="section-sub">
+          The driving chain traced backwards from the last-finishing activity, following the
+          predecessor that actually sets each early start. This is the longest path, which is not
+          always the same as everything P6 flags with zero float.
+        </p>
+      </div>
+      <div class="section-actions">
+        <button class="pill-btn" id="exportPathCsvBtn">Export path</button>
+      </div>
+    </div>
+
+    <div class="stat-row">
+      <div class="stat-tile"><span class="stat-label">Path length</span><span class="stat-value">${path.length} activities</span></div>
+      <div class="stat-tile"><span class="stat-label">Project duration</span><span class="stat-value">${totalDays.toFixed(1)} days</span></div>
+      <div class="stat-tile"><span class="stat-label">Zero-float activities</span><span class="stat-value">${cpm.criticalIds.length}</span></div>
+      ${network.droppedEdges ? `<div class="stat-tile"><span class="stat-label">Circular logic</span><span class="stat-value">${network.droppedEdges}</span></div>` : ''}
+    </div>
+
+    <div class="card">
+      <div class="table-responsive" style="max-height:560px;">
+        <table class="data-table">
+          <thead>
+            <tr><th style="width:44px">#</th><th>Activity ID</th><th>Activity name</th><th>Duration (d)</th><th>Total float (d)</th><th>Cumulative (d)</th></tr>
+          </thead>
+          <tbody>
+            ${path.map((idx, n) => {
+              const a = xer.activities[idx];
+              return `
+                <tr>
+                  <td class="muted">${n + 1}</td>
+                  <td><strong>${escapeHtml(a.task_code)}</strong></td>
+                  <td>${escapeHtml(a.task_name)}</td>
+                  <td>${(network.durations[idx] / hpd).toFixed(1)}</td>
+                  <td>${(cpm.totalFloat[idx] / hpd).toFixed(1)}</td>
+                  <td>${(cpm.earlyFinish[idx] / hpd).toFixed(1)}</td>
+                </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
       </div>
     </div>
   `;
+
+  document.getElementById('exportPathCsvBtn')?.addEventListener('click', () => {
+    const rows = [['#', 'Activity ID', 'Activity name', 'Duration (d)', 'Total float (d)', 'Cumulative (d)']];
+    path.forEach((idx, n) => {
+      const a = xer.activities[idx];
+      rows.push([
+        String(n + 1), a.task_code, a.task_name,
+        (network.durations[idx] / hpd).toFixed(1),
+        (cpm.totalFloat[idx] / hpd).toFixed(1),
+        (cpm.earlyFinish[idx] / hpd).toFixed(1),
+      ]);
+    });
+    downloadCSV(rows, 'longest-path.csv');
+  });
+}
+
+
+function fmtDate(d: Date): string {
+  return formatDate(d.toISOString());
 }
 
 function renderMonteCarlo() {
@@ -742,330 +1099,298 @@ function renderMonteCarlo() {
   const container = document.getElementById('tab-risk');
   if (!container) return;
 
-  const riskResult = runMonteCarloRisk(currentXER);
-  const activities = currentXER.activities.filter(a => a.target_drtn_hr_cnt > 0);
+  const result = runMonteCarloRisk(currentXER, riskSettings);
+  lastRiskResult = result;
+  const diag = result.diagnostics;
 
-  container.innerHTML = `
-    <!-- Top QSRA Header -->
-    <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px; margin-bottom:20px;">
-      <h2 style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:8px">Schedule Risk Analysis, screening grade BETA</h2>
-      <p style="color:#64748b; font-size:13px; max-width:900px; line-height:1.5;">
-        A Monte Carlo simulation of your Primavera P6 network, in the browser. It answers one question honestly: how much confidence does your deterministic finish date actually deserve, and which activities drive the risk?
-      </p>
-    </div>
-
-    <!-- Step 1: Load & Validate -->
-    <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px; margin-bottom:20px;">
-      <h3 style="font-size:16px; font-weight:700; margin-bottom:8px">1 · Load & validate</h3>
-      <p style="color:#64748b; font-size:13px; margin-bottom:12px">
-        Before simulating, the engine reproduces your deterministic schedule and checks it against the XER’s own dates.
-      </p>
-      
-      <div style="background:#fef3c7; border:1px solid #fde68a; border-radius:6px; padding:12px; font-size:13px; color:#92400e; margin-bottom:12px">
-        Engine reproduces 32.6% of activities within ±1 working day. Project finish: computed 21-Sep-2011 vs XER 15-Sep-2011 (+18 wd).<br>
-        ⚠️ 27 incomplete activities have no predecessor (open ends). Fix logic before simulating — broken logic makes risk analysis meaningless.
-      </div>
-
-      <label class="checkbox-label" style="font-size:13px; font-weight:600">
-        <input type="checkbox" checked /> I understand the engine can’t fully reproduce this schedule; results are indicative only.
-      </label>
-    </div>
-
-    <!-- Step 2: Ranges & Settings -->
-    <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px; margin-bottom:20px;">
-      <h3 style="font-size:16px; font-weight:700; margin-bottom:12px">2 · Ranges & settings</h3>
-
-      <div style="display:grid; grid-template-columns: repeat(6, 1fr); gap:12px; margin-bottom:16px;">
-        <div>
-          <label style="font-size:11px; font-weight:600; color:#64748b">Optimistic %</label>
-          <input type="number" class="number-input" value="90" style="width:100%" />
-        </div>
-        <div>
-          <label style="font-size:11px; font-weight:600; color:#64748b">Most likely %</label>
-          <input type="number" class="number-input" value="100" style="width:100%" />
-        </div>
-        <div>
-          <label style="font-size:11px; font-weight:600; color:#64748b">Pessimistic %</label>
-          <input type="number" class="number-input" value="115" style="width:100%" />
-        </div>
-        <div>
-          <label style="font-size:11px; font-weight:600; color:#64748b">Distribution</label>
-          <select class="select-input" style="width:100%"><option>Triangular</option></select>
-        </div>
-        <div>
-          <label style="font-size:11px; font-weight:600; color:#64748b">Iterations</label>
-          <input type="number" class="number-input" value="3000" style="width:100%" />
-        </div>
-        <div>
-          <label style="font-size:11px; font-weight:600; color:#64748b">Seed</label>
-          <input type="number" class="number-input" value="12345" style="width:100%" />
-        </div>
-      </div>
-
-      <div style="margin-bottom:16px;">
-        <button class="pill-btn active" id="runSimBtn" style="padding:8px 20px; font-weight:700">Simulate →</button>
-        <button class="pill-btn">Export profile</button>
-        <button class="pill-btn">Import profile</button>
-      </div>
-
-      <!-- Activity Range Grid -->
-      <div class="table-responsive" style="max-height:280px; overflow:auto;">
-        <table class="gantt-table">
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>Name</th>
-              <th>WBS</th>
-              <th>Dur (wd)</th>
-              <th>O%</th>
-              <th>M%</th>
-              <th>P%</th>
-              <th>Source</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${activities.slice(0, 15).map(a => `
-              <tr>
-                <td><strong>${a.task_code}</strong></td>
-                <td>${a.task_name}</td>
-                <td>NRG00870.FO.PS</td>
-                <td>${(a.target_drtn_hr_cnt / 8).toFixed(1)}</td>
-                <td>90</td>
-                <td>100</td>
-                <td>115</td>
-                <td><span style="color:#64748b; font-size:11px">global</span></td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- Step 3: Results (S-Curve & Drivers) -->
-    <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px;">
-      <h3 style="font-size:16px; font-weight:700; margin-bottom:12px">3 · Results</h3>
-
-      <!-- Yellow Summary Callouts -->
-      <div style="background:#fffbebf0; border:1px solid #fde68a; border-radius:6px; padding:12px; font-size:13px; color:#92400e; margin-bottom:10px">
-        Your plan finish date is <strong>P26</strong> — i.e. a 26% chance of finishing on or before it. P80 is <strong>22-Sep-2011</strong> (3 wd later than plan). Deterministic dates are usually optimistic — this is merge bias.
-      </div>
-
-      <div style="background:#fffbebf0; border:1px solid #fde68a; border-radius:6px; padding:12px; font-size:13px; color:#92400e; margin-bottom:20px">
-        ⚠️ <strong>2 relationships with positive lag and 0 with negative lag (leads).</strong> Lags are held fixed in the simulation — unlike activity durations they are not risk-ranged, and a negative lag lets a successor start before its predecessor finishes, which can mask or distort the risk. Review these before relying on the result. The full list is included as an appendix in the PDF report.
-      </div>
-
-      <!-- S-Curve + Histogram Combo Canvas Chart -->
-      <div style="position:relative; margin-bottom:20px; background:#fff; border:1px solid #f1f5f9; padding:16px; border-radius:8px;">
-        <canvas id="qsraComboCanvas" height="140"></canvas>
-      </div>
-
-      <!-- What am I looking at dropdown -->
-      <details style="margin-bottom:20px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:10px 14px;">
-        <summary style="font-weight:600; cursor:pointer; color:#0f172a">▾ What am I looking at? (S-curve & P-values)</summary>
-        <p style="color:#64748b; font-size:12px; margin-top:6px;">
-          The S-curve is the cumulative probability of finishing by each date. P80 means an 80% chance of finishing on or before that date. Your deterministic plan date usually lands low (often ~P20–P40) because of merge bias: where two paths join, the later one wins, so parallel risk only ever pushes the date out, never in.
-        </p>
-      </details>
-
-      <!-- Watched Date P-Values Table -->
-      <div style="margin-bottom:24px;">
-        <table class="gantt-table">
-          <thead>
-            <tr>
-              <th style="width:160px;">Watched date</th>
-              <th style="width:300px;">Name</th>
-              <th style="width:100px;">P10</th>
-              <th style="width:100px;">P50</th>
-              <th style="width:100px;">P80</th>
-              <th style="width:100px;">P90</th>
-              <th style="width:90px;">Plan =</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td><strong>PROJECT FINISH</strong></td>
-              <td></td>
-              <td>20-Sep-2011</td>
-              <td>21-Sep-2011</td>
-              <td><strong>22-Sep-2011</strong></td>
-              <td>22-Sep-2011</td>
-              <td><strong>P26</strong></td>
-            </tr>
-            <tr>
-              <td>FO60025</td>
-              <td>INCREASE RX POWER FROM 30% TO 100%</td>
-              <td>20-Sep-2011</td>
-              <td>21-Sep-2011</td>
-              <td><strong>22-Sep-2011</strong></td>
-              <td>22-Sep-2011</td>
-              <td>P27</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <!-- Drivers & Sensitivity Side-by-Side Bar Charts -->
-      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:24px; margin-bottom:16px;">
-        <!-- Criticality Index -->
-        <div>
-          <h4 style="font-size:13px; font-weight:700; color:#334155; margin-bottom:8px">Criticality index (% of iterations on the critical path)</h4>
-          <div style="display:flex; flex-direction:column; gap:4px; max-height:360px; overflow-y:auto; padding-right:6px;">
-            ${riskResult.criticalityIndex.map(c => `
-              <div style="display:flex; align-items:center; gap:8px; font-size:11px;">
-                <span style="width:70px; text-align:right; font-weight:600; color:#475569">${c.activityCode}</span>
-                <div style="flex:1; background:#e2e8f0; height:14px; border-radius:2px; overflow:hidden;">
-                  <div style="width:${c.percentage}%; background:#2563eb; height:100%;"></div>
-                </div>
-                <span style="width:40px; color:#64748b; font-weight:600">${c.percentage}%</span>
-              </div>
-            `).join('')}
-          </div>
-        </div>
-
-        <!-- Duration Sensitivity -->
-        <div>
-          <h4 style="font-size:13px; font-weight:700; color:#334155; margin-bottom:8px">Duration sensitivity (correlation with finish)</h4>
-          <div style="display:flex; flex-direction:column; gap:4px; max-height:360px; overflow-y:auto; padding-right:6px;">
-            ${riskResult.durationSensitivity.map(s => `
-              <div style="display:flex; align-items:center; gap:8px; font-size:11px;">
-                <span style="width:70px; text-align:right; font-weight:600; color:#475569">${s.activityCode}</span>
-                <div style="flex:1; background:#e2e8f0; height:14px; border-radius:2px; overflow:hidden;">
-                  <div style="width:${s.correlation * 100}%; background:#2563eb; height:100%;"></div>
-                </div>
-                <span style="width:40px; color:#64748b; font-weight:600">${s.correlation}</span>
-              </div>
-            `).join('')}
-          </div>
-        </div>
-      </div>
-
-      <!-- Export Toolbar Actions -->
-      <div style="margin-top:16px; display:flex; gap:10px;">
-        <button class="pill-btn active" id="exportQSRAPdfBtn" style="padding:6px 16px; font-weight:700">📄 PDF summary report</button>
-        <button class="pill-btn">Chart PNG</button>
-        <button class="pill-btn">Drivers CSV</button>
-      </div>
-
-      <!-- Explanatory Footer Callout -->
-      <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:10px 14px; font-size:12px; color:#64748b; margin-top:16px;">
-        <strong>Bar colour key:</strong> bars are ranked biggest-driver first. <span style="color:#2563eb; font-weight:700">Blue</span> bars are positive, <span style="color:#16a34a; font-weight:700">green</span> bars are negative. Criticality is always positive (a % of iterations on the critical path), so those bars are always blue.
-      </div>
-
-      <details style="margin-top:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:10px 14px;">
-        <summary style="font-weight:600; cursor:pointer; color:#0f172a">▾ Criticality vs cruciality?</summary>
-        <p style="color:#64748b; font-size:12px; margin-top:6px;">
-          <strong>Criticality index</strong> = how often an activity sits on the critical path across iterations. <strong>Sensitivity/cruciality</strong> = how strongly an activity’s sampled duration correlates with the finish date. High criticality + high sensitivity = a true risk driver.
-        </p>
-      </details>
-    </div>
-  `;
-
-  // Attach PDF Export Listener
-  const pdfBtn = document.getElementById('exportQSRAPdfBtn');
-  if (pdfBtn) {
-    pdfBtn.addEventListener('click', exportQSRAPdfReport);
+  const warnings: string[] = [];
+  if (diag.openEnds > 0) {
+    warnings.push(`${diag.openEnds} incomplete activities have an open end (no predecessor or no successor). Broken logic makes risk analysis unreliable — fix it before quoting these numbers.`);
+  }
+  if (diag.cyclesDropped > 0) {
+    warnings.push(`${diag.cyclesDropped} activities sit in a circular relationship. They were scheduled in file order so the passes could terminate; their dates are approximate.`);
+  }
+  if (diag.leads > 0 || diag.lags > 0) {
+    warnings.push(`${diag.lags} relationships carry positive lag and ${diag.leads} carry negative lag (leads). Lags are held fixed across iterations — they are not risk-ranged, so they can mask exposure.`);
+  }
+  if (diag.reconciliationDeltaDays !== null && Math.abs(diag.reconciliationDeltaDays) > 5) {
+    warnings.push(`The engine's deterministic finish is ${diag.reconciliationDeltaDays > 0 ? '+' : ''}${diag.reconciliationDeltaDays} days from the finish in the XER. Calendars are not modelled, so treat the absolute dates as indicative and the ranking of drivers as the useful output.`);
   }
 
-  // Render Hybrid S-Curve + Histogram Chart
-  const comboCtx = document.getElementById('qsraComboCanvas') as HTMLCanvasElement;
+  const maxCrit = Math.max(1, ...result.criticalityIndex.map(c => c.percentage));
+  const maxSens = Math.max(0.01, ...result.durationSensitivity.map(s => Math.abs(s.correlation)));
+
+  container.innerHTML = `
+    <div class="section-head">
+      <div>
+        <h2>Schedule risk analysis <span class="tag tag-beta">screening grade</span></h2>
+        <p class="section-sub">
+          A seeded Monte Carlo simulation of your P6 network, run entirely in the browser. Every
+          iteration re-solves the critical path, so criticality and sensitivity are measured, not assumed.
+        </p>
+      </div>
+    </div>
+
+    <div class="stat-row">
+      <div class="stat-tile"><span class="stat-label">P10</span><span class="stat-value">${fmtDate(result.p10Date)}</span></div>
+      <div class="stat-tile"><span class="stat-label">P50</span><span class="stat-value">${fmtDate(result.p50Date)}</span></div>
+      <div class="stat-tile accent"><span class="stat-label">P80</span><span class="stat-value">${fmtDate(result.p80Date)}</span></div>
+      <div class="stat-tile"><span class="stat-label">P90</span><span class="stat-value">${fmtDate(result.p90Date)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Deterministic finish</span><span class="stat-value">${fmtDate(result.planDate)} <em>P${result.planPValue}</em></span></div>
+    </div>
+
+    ${warnings.length ? `<div class="callout callout-warn">
+      <strong>Before you rely on this</strong>
+      <ul>${warnings.map(w => `<li>${escapeHtml(w)}</li>`).join('')}</ul>
+    </div>` : `<div class="callout callout-ok">No logic defects were detected that would invalidate the simulation.</div>`}
+
+    <div class="card">
+      <h3>Ranges &amp; settings</h3>
+      <div class="form-grid-6">
+        <label>Optimistic %<input type="number" class="number-input" id="riskOpt" value="${riskSettings.optimisticPct}" min="1" max="200" /></label>
+        <label>Most likely %<input type="number" class="number-input" id="riskMode" value="${riskSettings.mostLikelyPct}" min="1" max="300" /></label>
+        <label>Pessimistic %<input type="number" class="number-input" id="riskPess" value="${riskSettings.pessimisticPct}" min="1" max="500" /></label>
+        <label>Distribution
+          <select class="select-input" id="riskDist">
+            <option value="Beta-PERT" ${riskSettings.distribution === 'Beta-PERT' ? 'selected' : ''}>Beta-PERT</option>
+            <option value="Triangular" ${riskSettings.distribution === 'Triangular' ? 'selected' : ''}>Triangular</option>
+          </select>
+        </label>
+        <label>Iterations<input type="number" class="number-input" id="riskIters" value="${riskSettings.iterations}" min="100" max="20000" step="100" /></label>
+        <label>Seed<input type="number" class="number-input" id="riskSeed" value="${riskSettings.seed}" /></label>
+      </div>
+      <div class="button-row">
+        <button class="pill-btn active" id="runSimBtn">Run simulation</button>
+        <button class="pill-btn" id="exportQSRAPdfBtn">PDF summary report</button>
+        <button class="pill-btn" id="exportDriversCsvBtn">Drivers CSV</button>
+      </div>
+      <p class="muted">
+        ${diag.activitiesSimulated} duration-bearing activities · ${result.iterations} iterations ·
+        ${result.distribution} · seed ${result.seed} (the same seed always reproduces this result).
+      </p>
+    </div>
+
+    <div class="card">
+      <h3>Completion distribution</h3>
+      <div class="chart-wrap"><canvas id="qsraComboCanvas" height="130"></canvas></div>
+      <details class="explainer">
+        <summary>What am I looking at?</summary>
+        <p>
+          The line is the cumulative probability of finishing by each date; the bars are how many of the
+          ${result.iterations} iterations landed in each window. P80 means an 80% chance of finishing on or
+          before that date. Deterministic dates usually land low because of merge bias: where paths join, the
+          later one wins, so parallel risk only ever pushes the date out.
+        </p>
+      </details>
+      <p class="muted">
+        Simulated project duration: ${result.minDurationDays}–${result.maxDurationDays} days
+        (mean ${result.meanDurationDays}, P50 ${result.p50DurationDays}).
+      </p>
+    </div>
+
+    <div class="two-col">
+      <div class="card">
+        <h3>Criticality index</h3>
+        <p class="muted">Share of iterations each activity spent on the critical path.</p>
+        <div class="bar-list">
+          ${result.criticalityIndex.length ? result.criticalityIndex.map(c => `
+            <div class="bar-row" title="${escapeHtml(c.activityName)}">
+              <span class="bar-label">${escapeHtml(c.activityCode)}</span>
+              <div class="bar-track"><div class="bar-fill" style="width:${(c.percentage / maxCrit) * 100}%"></div></div>
+              <span class="bar-value">${c.percentage.toFixed(1)}%</span>
+            </div>
+          `).join('') : '<p class="muted">No activity reached the critical path in any iteration.</p>'}
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Duration sensitivity</h3>
+        <p class="muted">Pearson correlation between an activity's sampled duration and the project finish.</p>
+        <div class="bar-list">
+          ${result.durationSensitivity.length ? result.durationSensitivity.map(s => `
+            <div class="bar-row" title="${escapeHtml(s.activityName)}">
+              <span class="bar-label">${escapeHtml(s.activityCode)}</span>
+              <div class="bar-track"><div class="bar-fill ${s.correlation < 0 ? 'negative' : ''}" style="width:${(Math.abs(s.correlation) / maxSens) * 100}%"></div></div>
+              <span class="bar-value">${s.correlation.toFixed(2)}</span>
+            </div>
+          `).join('') : '<p class="muted">Not enough variation to correlate.</p>'}
+        </div>
+      </div>
+    </div>
+
+    <details class="explainer">
+      <summary>Criticality vs sensitivity</summary>
+      <p>
+        <strong>Criticality index</strong> is how often an activity sits on the critical path across iterations.
+        <strong>Sensitivity</strong> is how strongly its sampled duration moves the finish date. High on both
+        means a genuine risk driver; high criticality with low sensitivity usually means a short activity that
+        is always on the path but never moves it.
+      </p>
+    </details>
+  `;
+
+  document.getElementById('runSimBtn')?.addEventListener('click', () => {
+    const num = (id: string, fallback: number) => {
+      const v = parseFloat((document.getElementById(id) as HTMLInputElement)?.value);
+      return Number.isFinite(v) ? v : fallback;
+    };
+    const opt = num('riskOpt', riskSettings.optimisticPct);
+    const mode = num('riskMode', riskSettings.mostLikelyPct);
+    const pess = num('riskPess', riskSettings.pessimisticPct);
+
+    if (!(opt <= mode && mode <= pess)) {
+      alert('Ranges must satisfy optimistic ≤ most likely ≤ pessimistic.');
+      return;
+    }
+
+    riskSettings = {
+      ...riskSettings,
+      optimisticPct: opt,
+      mostLikelyPct: mode,
+      pessimisticPct: pess,
+      iterations: num('riskIters', riskSettings.iterations),
+      seed: num('riskSeed', riskSettings.seed),
+      distribution: ((document.getElementById('riskDist') as HTMLSelectElement)?.value ||
+        riskSettings.distribution) as QSRARiskSettings['distribution'],
+    };
+    renderMonteCarlo();
+  });
+
+  document.getElementById('exportQSRAPdfBtn')?.addEventListener('click', exportQSRAPdfReport);
+
+  document.getElementById('exportDriversCsvBtn')?.addEventListener('click', () => {
+    const rows = [['Type', 'Activity ID', 'Activity name', 'Value']];
+    result.criticalityIndex.forEach(c => rows.push(['Criticality %', c.activityCode, c.activityName, c.percentage.toFixed(1)]));
+    result.durationSensitivity.forEach(s => rows.push(['Sensitivity r', s.activityCode, s.activityName, s.correlation.toFixed(3)]));
+    downloadCSV(rows, 'qsra-risk-drivers.csv');
+  });
+
+  const comboCtx = document.getElementById('qsraComboCanvas') as HTMLCanvasElement | null;
   if (comboCtx) {
     if (riskChartInstance) riskChartInstance.destroy();
+
+    // Chart.js has no concept of our theme, so hand it the resolved token values.
+    const css = getComputedStyle(document.documentElement);
+    const token = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
+    const textColour = token('--text-muted', '#64748b');
+    const gridColour = token('--border', '#e2e8f0');
+    const accent = token('--accent', '#2563eb');
+    Chart.defaults.color = textColour;
+    Chart.defaults.borderColor = gridColour;
+    Chart.defaults.font.family = token('--font', 'sans-serif');
     riskChartInstance = new Chart(comboCtx, {
       type: 'bar',
       data: {
-        labels: ['19-Sep-2011', '20-Sep-2011', '21-Sep-2011', '22-Sep-2011', '23-Sep-2011', '24-Sep-2011', '25-Sep-2011', '26-Sep-2011'],
+        labels: result.sCurveData.map(p => p.dateLabel),
         datasets: [
           {
             type: 'line',
-            label: 'S-Curve Cumulative %',
-            data: [0, 20, 60, 88, 92, 95, 98, 100],
-            borderColor: '#2563eb',
+            label: 'Cumulative probability',
+            data: result.sCurveData.map(p => p.probability),
+            borderColor: accent,
             borderWidth: 3,
+            pointRadius: 0,
             fill: false,
-            tension: 0.3,
-            yAxisID: 'yS'
+            tension: 0.25,
+            yAxisID: 'yS',
           },
           {
             type: 'bar',
-            label: 'Iteration Histogram Density',
-            data: [2, 22, 58, 32, 10, 5, 2, 1],
-            backgroundColor: 'rgba(37, 99, 235, 0.15)',
-            barPercentage: 0.6,
-            yAxisID: 'yH'
-          }
-        ]
+            label: 'Iterations',
+            data: result.distributionHistogram.map(b => b.count),
+            backgroundColor: accent + '2e',
+            borderColor: accent + '66',
+            borderWidth: 1,
+            barPercentage: 0.9,
+            categoryPercentage: 1,
+            yAxisID: 'yH',
+          },
+        ],
       },
       options: {
         responsive: true,
-        plugins: {
-          legend: { display: false }
-        },
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { display: true, position: 'bottom' } },
         scales: {
-          x: { grid: { color: '#f1f5f9' } },
-          yS: { position: 'left', min: 0, max: 100, ticks: { callback: v => `${v}%` } },
-          yH: { position: 'right', min: 0, max: 100, display: false }
-        }
-      }
+          x: { grid: { display: false }, ticks: { color: textColour, maxRotation: 45, autoSkipPadding: 12 } },
+          yS: { position: 'left', min: 0, max: 100, grid: { color: gridColour }, ticks: { color: textColour, callback: v => `${v}%` }, title: { display: true, text: 'Confidence', color: textColour } },
+          yH: { position: 'right', beginAtZero: true, grid: { display: false }, ticks: { color: textColour }, title: { display: true, text: 'Iterations', color: textColour } },
+        },
+      },
     });
   }
 }
 
-import jsPDF from 'jspdf';
 
-function exportQSRAPdfReport() {
+// jsPDF is ~350 kB, so it is fetched only when a report is actually requested.
+async function exportQSRAPdfReport() {
+  if (!currentXER || !lastRiskResult) return;
+  const result = lastRiskResult;
+  const { default: jsPDF } = await import('jspdf');
   const doc = new jsPDF('p', 'mm', 'a4');
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(18);
-  doc.text('Schedule Risk Analysis (QSRA-lite) Screening Report', 14, 20);
+  const left = 14;
+  const pageBottom = 275;
+  let y = 20;
 
-  doc.setFontSize(10);
-  doc.setFont('helvetica', 'normal');
-  doc.text('Project: NRG00870 — Baytown, TX - Offline Maintenance Work', 14, 28);
-  doc.text(`Generated: ${new Date().toLocaleDateString()}`, 14, 34);
+  const line = (text: string, opts: { size?: number; bold?: boolean; indent?: number; gap?: number } = {}) => {
+    doc.setFont('helvetica', opts.bold ? 'bold' : 'normal');
+    doc.setFontSize(opts.size ?? 10);
+    // Wrap long activity names instead of letting them run off the page.
+    const wrapped = doc.splitTextToSize(text, 182 - (opts.indent ?? 0));
+    for (const part of wrapped) {
+      if (y > pageBottom) { doc.addPage(); y = 20; }
+      doc.text(part, left + (opts.indent ?? 0), y);
+      y += opts.gap ?? 5.5;
+    }
+  };
 
-  doc.setLineWidth(0.5);
-  doc.line(14, 38, 196, 38);
+  const project = currentXER.project;
+  doc.setTextColor(15, 23, 42);
+  line('Schedule Risk Analysis — screening report', { size: 17, bold: true, gap: 8 });
+  line(`Project: ${project?.proj_short_name ?? '—'} — ${project?.proj_name ?? 'Untitled'}`);
+  line(`Generated: ${new Date().toLocaleString()}`);
+  line(`Method: ${result.distribution}, ${result.iterations} iterations, seed ${result.seed}`, { gap: 8 });
 
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(12);
-  doc.text('1. Risk Summary & P-Values', 14, 46);
+  doc.setLineWidth(0.4);
+  doc.line(left, y, 196, y);
+  y += 8;
 
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(10);
-  doc.text('• Plan Finish Date: 15-Sep-2011 (P26 confidence level)', 18, 54);
-  doc.text('• P50 Forecast Finish: 21-Sep-2011', 18, 60);
-  doc.text('• P80 Forecast Finish: 22-Sep-2011 (+3 working days delay exposure)', 18, 66);
-  doc.text('• P90 Forecast Finish: 22-Sep-2011', 18, 72);
+  line('1. Forecast completion', { size: 12, bold: true, gap: 7 });
+  line(`P10: ${fmtDate(result.p10Date)}`, { indent: 4 });
+  line(`P50: ${fmtDate(result.p50Date)}`, { indent: 4 });
+  line(`P80: ${fmtDate(result.p80Date)}`, { indent: 4 });
+  line(`P90: ${fmtDate(result.p90Date)}`, { indent: 4 });
+  line(`Deterministic finish ${fmtDate(result.planDate)} carries P${result.planPValue} confidence.`, { indent: 4, gap: 8 });
 
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(12);
-  doc.text('2. Key Schedule Risk Drivers (Top Criticality)', 14, 84);
+  line('2. Schedule health caveats', { size: 12, bold: true, gap: 7 });
+  const d = result.diagnostics;
+  line(`Activities simulated: ${d.activitiesSimulated}`, { indent: 4 });
+  line(`Open ends: ${d.openEnds} · circular logic: ${d.cyclesDropped}`, { indent: 4 });
+  line(`Relationships with lag: ${d.lags} · with leads: ${d.leads}`, { indent: 4 });
+  if (d.reconciliationDeltaDays !== null) {
+    line(`Engine finish vs XER finish: ${d.reconciliationDeltaDays > 0 ? '+' : ''}${d.reconciliationDeltaDays} days.`, { indent: 4 });
+  }
+  line('Calendars are not modelled; absolute dates are indicative and driver ranking is the primary output.', { indent: 4, gap: 8 });
 
-  const topDrivers = [
-    '• FO30010: COOLDOWN RCS TO LESS THAN 350 DEGREES (99.9% Criticality)',
-    '• FO30012: ESTABLISH N2 TO THE PORVS PER SOP-SI-1 (99.9% Criticality)',
-    '• FO30014: PLACE RHR IN SERVICE PER SOP-RHR-1 (99.9% Criticality)',
-    '• FO30015: COOLDOWN RCS TO LESS THAN 200 DEGREES (99.9% Criticality)',
-    '• FO40007: COOLDOWN RCS TO 190 TO 180 DEGREES (Correlation: 0.59)',
-  ];
-
-  let y = 92;
-  topDrivers.forEach(d => {
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(10);
-    doc.text(d, 18, y);
-    y += 6;
+  line('3. Top criticality drivers', { size: 12, bold: true, gap: 7 });
+  result.criticalityIndex.slice(0, 10).forEach(c => {
+    line(`${c.activityCode} — ${c.activityName} (${c.percentage.toFixed(1)}%)`, { indent: 4 });
   });
+  y += 3;
 
-  doc.setLineWidth(0.2);
-  doc.line(14, y + 4, 196, y + 4);
+  line('4. Top duration sensitivity', { size: 12, bold: true, gap: 7 });
+  result.durationSensitivity.slice(0, 10).forEach(s => {
+    line(`${s.activityCode} — ${s.activityName} (r = ${s.correlation.toFixed(2)})`, { indent: 4 });
+  });
 
   doc.setFontSize(8);
   doc.setTextColor(100);
-  doc.text('Open-Source Project Controls Suite • Built with TypeScript • 100% Client-Side Private Report', 14, 285);
+  doc.text('TPPSCI · generated entirely in the browser — no schedule data left this machine.', left, 288);
 
-  doc.save('qsra-screening-report.pdf');
+  doc.save(`qsra-screening-report-${project?.proj_short_name ?? 'project'}.pdf`);
 }
+
 
 function renderTimeChainage() {
   const container = document.getElementById('tab-linear');
@@ -1082,6 +1407,8 @@ function renderTimeChainage() {
   ];
 
   container.innerHTML = `
+    ${prototypeBanner('Chainage mapping uses a built-in demo linear scheme.')}
+
     <!-- Top Tool Header -->
     <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px; margin-bottom:20px;">
       <h2 style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:8px">Time–Chainage chart generator BETA</h2>
@@ -1250,11 +1577,26 @@ function renderTimeChainage() {
 }
 
 
+
+/**
+ * Some modules are still interface prototypes: they demonstrate the intended
+ * workflow but do not yet compute from the loaded schedule. Saying so in the UI
+ * is better than letting a mockup be mistaken for a working analysis.
+ */
+function prototypeBanner(what: string): string {
+  return `<div class="callout callout-warn" role="note">
+    <strong>Prototype</strong> — ${escapeHtml(what)} This tab shows the intended
+    workflow with illustrative content; it is not yet computed from the schedule you have loaded.
+  </div>`;
+}
+
 function renderScheduleComparison() {
   const container = document.getElementById('tab-compare');
   if (!container) return;
 
   container.innerHTML = `
+    ${prototypeBanner('Multi-file schedule comparison is not wired to the loaded XER yet.')}
+
     <!-- Header Banner -->
     <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px; margin-bottom:20px;">
       <h2 style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:8px">Schedule Comparison & Milestone Slip Analysis BETA</h2>
@@ -1381,6 +1723,8 @@ function renderContractorRollup() {
   const activities = currentXER.activities;
 
   container.innerHTML = `
+    ${prototypeBanner('Contractor roll-up mapping is partially wired.')}
+
     <!-- Top Header -->
     <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px; margin-bottom:20px;">
       <h2 style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:8px">Contractor Progress Roll-Up ALPHA</h2>
@@ -1793,6 +2137,8 @@ function renderMSProjectFixer() {
   if (!container) return;
 
   container.innerHTML = `
+    ${prototypeBanner('The MSPDI inspector reports illustrative findings.')}
+
     <!-- Top Tool Header Banner -->
     <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px; margin-bottom:20px;">
       <h2 style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:8px">MS Project XML Importer & Fixer for Primavera P6 ALPHA</h2>

@@ -18,6 +18,9 @@ export interface XERActivity {
   free_float_hr_cnt: number;
   constraint_type?: string;
   constraint_date?: string;
+  /** TT_Task, TT_Mile, TT_FinMile, TT_LOE, TT_WBS */
+  task_type?: string;
+  is_milestone?: boolean;
   is_critical?: boolean;
 }
 
@@ -62,26 +65,42 @@ export interface DCMAThresholdConfig {
   ragBands: Record<number, { green: number; amber: number }>;
 }
 
+export type DCMARag = 'green' | 'amber' | 'red' | 'na';
+
 export interface DCMAMetric {
   id: number;
   name: string;
   description: string;
   target: string;
+  /** Unit the measured value is expressed in. */
+  unit: 'count' | 'percent' | 'ratio';
+  /** Raw numerator (flagged items) — 0 when the check is a ratio. */
   count: number;
+  /** Denominator the check is measured against. */
   total: number;
+  /** The measured value in `unit` terms; this is what is compared to the bands. */
+  value: number;
   percentage: number;
+  rag: DCMARag;
   passed: boolean;
-  isAmber?: boolean;
+  /** Populated when the check cannot be assessed (e.g. no baseline loaded). */
+  notAssessedReason?: string;
   flaggedTasks: XERActivity[];
 }
 
 export interface DCMAAssuranceReport {
   projectName: string;
   projectCode: string;
+  dataDate: Date | null;
   activityCount: number;
+  incompleteCount: number;
   relationshipCount: number;
   metrics: DCMAMetric[];
   overallScore: number;
+  greenCount: number;
+  amberCount: number;
+  redCount: number;
+  naCount: number;
   passedCount: number;
 }
 
@@ -94,6 +113,8 @@ export interface QSRARiskSettings {
   iterations: number;
   seed: number;
   correlation: string;
+  /** Divisor used to convert XER hour counts into working days. */
+  hoursPerDay: number;
 }
 
 export interface QSRARangeRow {
@@ -109,19 +130,34 @@ export interface QSRARangeRow {
 
 export interface MonteCarloResult {
   iterations: number;
+  seed: number;
+  distribution: QSRARiskSettings['distribution'];
   p10Date: Date;
   p50Date: Date;
   p80Date: Date;
   p90Date: Date;
+  /** Deterministic (as-scheduled) finish produced by the same CPM engine. */
   planDate: Date;
+  /** Confidence the deterministic date actually carries, 0-100. */
   planPValue: number;
   minDurationDays: number;
   maxDurationDays: number;
   meanDurationDays: number;
-  sCurveData: { dateLabel: string; probability: number }[];
+  p50DurationDays: number;
+  sCurveData: { dateLabel: string; date: Date; probability: number }[];
   distributionHistogram: { binLabel: string; count: number }[];
   criticalityIndex: { activityCode: string; activityName: string; percentage: number }[];
   durationSensitivity: { activityCode: string; activityName: string; correlation: number }[];
+  /** Honest reporting of what the engine could and could not do. */
+  diagnostics: {
+    activitiesSimulated: number;
+    openEnds: number;
+    cyclesDropped: number;
+    leads: number;
+    lags: number;
+    /** Working days between the engine's CPM finish and the XER's own dates. */
+    reconciliationDeltaDays: number | null;
+  };
 }
 
 export interface TimeChainageItem {

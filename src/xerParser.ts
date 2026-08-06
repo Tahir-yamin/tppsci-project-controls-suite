@@ -41,10 +41,16 @@ export function parseXERText(text: string): ParsedXER {
   let project: XERProject | null = null;
   if (rawTables['PROJECT'] && rawTables['PROJECT'].rows.length > 0) {
     const p = rawTables['PROJECT'].rows[0];
+    // P6 stores the readable project title on the root WBS node, not on
+    // PROJECT, so fall back through both before giving up.
+    const rootWbsName = (rawTables['PROJWBS']?.rows || []).find(
+      w => !w.parent_wbs_id && w.proj_id === p.proj_id,
+    )?.wbs_name;
+
     project = {
       proj_id: p.proj_id || '1',
       proj_short_name: p.proj_short_name || 'PROJECT',
-      proj_name: p.proj_short_name || 'P6 Schedule Project',
+      proj_name: rootWbsName || p.proj_short_name || 'P6 Schedule Project',
       create_date: p.create_date,
       last_recalc_date: p.last_recalc_date,
     };
@@ -86,6 +92,12 @@ export function parseXERText(text: string): ParsedXER {
       free_float_hr_cnt: freeFloat,
       constraint_type: r.cstr_type,
       constraint_date: r.cstr_date,
+      task_type: r.task_type || 'TT_Task',
+      // Milestones are identified by their P6 task type; a zero duration is
+      // only a fallback for exports that omit the column.
+      is_milestone: r.task_type
+        ? r.task_type === 'TT_Mile' || r.task_type === 'TT_FinMile'
+        : targetDrtn === 0,
       is_critical: totalFloat <= 0 && r.status_code !== 'TK_Complete',
     };
   });
