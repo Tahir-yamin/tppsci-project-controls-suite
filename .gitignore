@@ -27,3 +27,5 @@ dist-ssr
 # Demo reel output from tools/record-demo.mjs (regenerate, don't commit)
 .video-frames-*/
 TPPSCI-linkedin-*.mp4
+.demo-music.wav
+.silent-*.mp4

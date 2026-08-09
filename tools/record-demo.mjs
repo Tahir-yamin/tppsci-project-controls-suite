@@ -11,6 +11,14 @@
 // project dependencies — install them ad hoc when you need to re-shoot:
 //   PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm i -D playwright ffmpeg-static
 // Set CHROME_PATH if Playwright's bundled Chromium is not where it expects.
+//
+// The take is silent. To add the generated backing track, render it at exactly
+// the video's length and mux with explicit stream maps (without -map, ffmpeg may
+// keep the video's own audio instead of the track you just made):
+//
+//   node tools/make-music.mjs 54.68 .demo-music.wav
+//   ffmpeg -i reel.mp4 -i .demo-music.wav -map 0:v:0 -map 1:a:0 \
+//     -filter:a volume=-3dB -c:v copy -c:a aac -b:a 192k -shortest out.mp4
 import { chromium } from 'playwright';
 import { mkdirSync, rmSync, copyFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
