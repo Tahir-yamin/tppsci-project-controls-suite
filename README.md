@@ -13,6 +13,19 @@ uploaded anywhere.
 
 ---
 
+## Demo
+
+[![Watch the demo](docs/demo-poster.png)](docs/demo.mp4)
+
+**▶ [Watch the 55-second walkthrough](docs/demo.mp4)** — the Gantt, all 14 DCMA checks
+with a drill-down, a live Monte Carlo run, the path analyser and the anonymiser.
+
+It is a recording of the real app, driven by [`tools/record-demo.mjs`](tools/record-demo.mjs),
+so every figure on screen is computed during the take rather than mocked up. It is
+captioned throughout and plays fine muted.
+
+---
+
 ## What it actually does
 
 Everything below is computed from the file you load. Where a check cannot be evaluated
@@ -185,7 +198,14 @@ src/
   main.ts            UI rendering and wiring
   style.css          Design tokens, light/dark themes, components
   cpm.test.ts        Unit tests
+
+tools/
+  record-demo.mjs    Records the demo reel by driving the built app in a browser
+  make-music.mjs     Synthesises the reel's backing track
 ```
+
+The `tools/` scripts are authoring aids, not part of the build, and their
+dependencies are installed ad hoc — see the header of each file.
 
 The CPM engine is deliberately calendar-free: it solves on a continuous hour scale and
 calibrates the hour-to-calendar factor against the schedule's own start-to-finish span.
