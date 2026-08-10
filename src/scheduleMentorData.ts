@@ -1,4 +1,4 @@
-import type { MentorTopic, XERActivity, XERRelationship } from './types';
+import type { MentorTopic } from './types';
 
 export const mentorTopics: MentorTopic[] = [
   // LOGIC CATEGORY

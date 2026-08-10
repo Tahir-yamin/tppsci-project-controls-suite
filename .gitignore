@@ -9,6 +9,7 @@ lerna-debug.log*
 
 node_modules
 dist
+dist-single
 dist-ssr
 *.local
 
@@ -22,3 +23,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Demo reel output from tools/record-demo.mjs (regenerate, don't commit)
+.video-frames-*/
+TPPSCI-linkedin-*.mp4
+.demo-music.wav
+.silent-*.mp4
