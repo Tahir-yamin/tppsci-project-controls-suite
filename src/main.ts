@@ -1029,7 +1029,7 @@ function renderPathAnalyser() {
   container.innerHTML = `
     <div class="section-head">
       <div>
-        <h2>Longest path analyser</h2>
+        <h2>Driving chain</h2>
         <p class="section-sub">
           The driving chain traced backwards from the last-finishing activity, following the
           predecessor that actually sets each early start. This is the longest path, which is not
@@ -1123,10 +1123,11 @@ function renderMonteCarlo() {
   container.innerHTML = `
     <div class="section-head">
       <div>
-        <h2>Schedule risk analysis <span class="tag tag-beta">screening grade</span></h2>
+        <h2>Forecast confidence <span class="tag tag-beta">screening grade</span></h2>
         <p class="section-sub">
-          A seeded Monte Carlo simulation of your P6 network, run entirely in the browser. Every
-          iteration re-solves the critical path, so criticality and sensitivity are measured, not assumed.
+          Quantitative schedule risk analysis (QSRA): a seeded Monte Carlo simulation of your P6
+          network, run entirely in the browser. Every iteration re-solves the critical path, so
+          criticality and sensitivity are measured, not assumed.
         </p>
       </div>
     </div>
@@ -1599,7 +1600,7 @@ function renderScheduleComparison() {
 
     <!-- Header Banner -->
     <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px; margin-bottom:20px;">
-      <h2 style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:8px">Schedule Comparison & Milestone Slip Analysis BETA</h2>
+      <h2 style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:8px">Drift — schedule comparison &amp; milestone slip BETA</h2>
       <p style="color:#64748b; font-size:13px; max-width:900px; line-height:1.5;">
         Compare P6 schedules, chart milestone slip and draft a factual narrative, 100% in your browser, nothing uploaded.
       </p>
@@ -1997,7 +1998,7 @@ function renderXERAnonymiser() {
   container.innerHTML = `
     <!-- Top Header -->
     <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px; margin-bottom:20px;">
-      <h2 style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:8px">XER Anonymiser BETA</h2>
+      <h2 style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:8px">Redact — XER anonymiser BETA</h2>
       <p style="color:#64748b; font-size:13px; max-width:900px; line-height:1.5; margin-bottom:12px;">
         Strip or pseudonymise the sensitive content in an Oracle Primavera P6 .xer file, names, resources, costs, notes, while keeping the analytical skeleton (logic, dates, durations, float) intact, so the scrubbed file still opens in P6 and in our other tools. For planners in nuclear, defence and commercially sensitive environments who can’t share a real programme but need it analysed.
       </p>
@@ -2141,9 +2142,9 @@ function renderMSProjectFixer() {
 
     <!-- Top Tool Header Banner -->
     <div style="background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px; margin-bottom:20px;">
-      <h2 style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:8px">MS Project XML Importer & Fixer for Primavera P6 ALPHA</h2>
+      <h2 style="font-size:20px; font-weight:700; color:#0f172a; margin-bottom:8px">Import Repair — MS Project XML for Primavera P6 ALPHA</h2>
       <p style="color:#64748b; font-size:13px; max-width:900px; line-height:1.5; margin-bottom:12px;">
-        Import a Microsoft Project .xml file (MSPDI, the format P6’s “Microsoft Project XML” import reads) to view and repair it. This tool finds the known defects that make P6’s import fail or corrupt the schedule, shows you each one, and returns a fixed XML, an experimental XER you can open in the XER Viewer, and a PDF change report.
+        Import a Microsoft Project .xml file (MSPDI, the format P6’s “Microsoft Project XML” import reads) to view and repair it. This tool finds the known defects that make P6’s import fail or corrupt the schedule, shows you each one, and returns a fixed XML, an experimental XER you can open in Schedule Lens, and a PDF change report.
       </p>
 
       <div style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; padding:12px; font-size:12px; color:#1e40af; margin-bottom:12px">
@@ -2240,7 +2241,7 @@ function renderMSProjectFixer() {
       </details>
       <details style="margin-bottom:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:10px 14px;">
         <summary style="font-weight:600; cursor:pointer; color:#0f172a">▾ What’s the difference between the fixed XML and the XER?</summary>
-        <p style="color:#64748b; font-size:12px; margin-top:6px;">The fixed XML is an MSPDI file ready to import into P6 via File → Import → Microsoft Project XML. The experimental XER converted directly from XML can be opened instantly in our XER Viewer.</p>
+        <p style="color:#64748b; font-size:12px; margin-top:6px;">The fixed XML is an MSPDI file ready to import into P6 via File → Import → Microsoft Project XML. The experimental XER converted directly from XML can be opened instantly in Schedule Lens.</p>
       </details>
     </div>
   `;

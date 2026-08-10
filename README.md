@@ -31,7 +31,7 @@ captioned throughout and plays fine muted.
 Everything below is computed from the file you load. Where a check cannot be evaluated
 from a single XER, the tool says so and marks it **N/A** rather than quietly passing it.
 
-### XER viewer & Gantt
+### Schedule Lens — XER viewer & Gantt
 Split-pane Gantt with a WBS tree, timeline scaled to the schedule's own date range
 (month / week / day zoom), a data-date line read from `PROJECT.last_recalc_date`,
 progress-filled bars, milestone diamonds from `task_type`, and filters for status,
@@ -61,7 +61,7 @@ RAG bands, the hours-per-day divisor and the float/duration horizon are all edit
 in **Thresholds & settings**, and the results recompute live. Click any check to drill
 into the flagged activities; export any list or the whole report to CSV.
 
-### Schedule risk analysis (QSRA, screening grade)
+### Forecast Confidence — schedule risk analysis (QSRA, screening grade)
 A seeded Monte Carlo simulation over a real CPM engine:
 
 - **Every iteration re-solves the network** — forward and backward pass — so the
@@ -81,7 +81,7 @@ The engine reports its own limitations rather than hiding them: open ends, circu
 logic, leads and lags held fixed, and how far its CPM finish sits from the dates in
 your file.
 
-### Longest path analyser
+### Driving Chain — longest path analyser
 Traces the driving chain backwards from the last-finishing activity, following the
 predecessor that actually sets each early start — which is not always the same as
 everything P6 tags with zero float.
@@ -90,14 +90,14 @@ everything P6 tags with zero float.
 Rule-by-rule guidance on logic, constraints, calendars, progress and structure, each
 one listing the activities in *your* schedule that trip it.
 
-### XER anonymiser
+### Redact — XER anonymiser
 Pseudonymises project, WBS, activity and resource names while preserving the
 analytical skeleton (logic, dates, float, calendars), and re-emits a valid `.xer`.
 
 ### Prototype modules
 These tabs demonstrate the intended workflow but are **not yet computed from the
 loaded schedule**, and say so in the UI:
-Schedule Comparison · Progress Roll-Up · Time–Chainage · MS Project Fixer.
+Drift (schedule comparison) · Progress Roll-Up · Time–Chainage · Import Repair (MS Project XML).
 
 ---
 
